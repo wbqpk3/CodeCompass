@@ -10,9 +10,12 @@
 #include <model/cppinheritance-odb.hxx>
 #include <model/cpprecord.h>
 #include <model/cpprecord-odb.hxx>
-
+#include <model/cpptypedependencymetrics.h>
+#include <model/cpptypedependencymetrics-odb.hxx>
 #include <model/cppastnode.h>
 #include <model/cppastnode-odb.hxx>
+#include <model/file.h>
+#include <model/file-odb.hxx>
 
 #include <boost/filesystem.hpp>
 
@@ -390,7 +393,7 @@ void CppMetricsParser::efferentTypeLevel()
           dependentTypes.clear();
 
           // Count parent types
-          auto inheritanceView = _ctx.db->query<model::CppInheritanceCount>(
+          auto inheritanceView = _ctx.db->query<model::CppInheritance>(
             InheritanceQuery::derived == type.entityHash);
 
           // Count unique attribute types
@@ -423,8 +426,26 @@ void CppMetricsParser::efferentTypeLevel()
           model::CppAstNodeMetrics metric;
           metric.astNodeId = type.astNodeId;
           metric.type = model::CppAstNodeMetrics::Type::EFFERENT_TYPE;
-          metric.value = inheritanceView.begin()->count + dependentTypes.size();
+          metric.value = inheritanceView.size() + dependentTypes.size();
           _ctx.db->persist(metric);
+
+          auto typeRelationInserter = [this](const std::uint64_t& entityHash, const std::uint64_t& dependencyHash)
+          {
+            model::CppTypeDependencyMetrics relation;
+            relation.entityHash = entityHash;
+            relation.dependencyHash = dependencyHash;
+            _ctx.db->persist(relation);
+          };
+
+          // Insert type dependency relations
+          for (const std::uint64_t& d : dependentTypes) {
+            typeRelationInserter(type.entityHash, d);
+          }
+
+          // Insert inheritance relations
+          for (const model::CppInheritance& d : inheritanceView) {
+            typeRelationInserter(type.entityHash, d.base);
+          }
         }
       });
   });
@@ -513,6 +534,37 @@ void CppMetricsParser::afferentTypeLevel()
   });
 }
 
+void CppMetricsParser::efferentModuleLevel()
+{
+  parallelCalcMetric<model::File>(
+    "Efferent coupling at module level",
+    _threadCount * efferentCouplingModulesPartitionMultiplier,// number of jobs; adjust for granularity
+    odb::query<cc::model::File>::type == cc::model::File::DIRECTORY_TYPE && getFilterPathsQuery<model::File>(),
+    [&, this](const MetricsTasks<model::File>& tasks)
+    {
+      util::OdbTransaction{_ctx.db}([&, this]
+      {
+        typedef odb::query<cc::model::CppAstNode> AstQuery;
+        typedef odb::query<cc::model::CppInheritance> InheritanceQuery;
+        typedef odb::query<cc::model::CppMemberType> MemTypeQuery;
+        typedef odb::result<cc::model::CppAstNode> AstResult;
+        typedef odb::result<cc::model::CppMemberTypeAstView> MemTypeAstResult;
+
+        std::set<std::uint64_t> dependentTypes;
+        for (const model::File& type : tasks)
+        {
+          dependentTypes.clear();
+
+          /*model::CppAstNodeMetrics metric;*/
+          /*metric.astNodeId = type.astNodeId;*/
+          /*metric.type = model::CppAstNodeMetrics::Type::AFFERENT_TYPE;*/
+          /*metric.value = dependentTypes.size();*/
+          /*_ctx.db->persist(metric);*/
+        }
+      });
+  });
+}
+
 bool CppMetricsParser::parse()
 {
   LOG(info) << "[cppmetricsparser] Computing function parameter count metric.";
@@ -529,6 +581,8 @@ bool CppMetricsParser::parse()
   efferentTypeLevel();
   LOG(info) << "[cppmetricsparser] Computing afferent coupling metric for types.";
   afferentTypeLevel();
+  LOG(info) << "[cppmetricsparser] Computing efferent coupling metric at module level.";
+  efferentModuleLevel(); // This metric needs to be calculated after efferentTypeLevel
   return true;
 }
 
